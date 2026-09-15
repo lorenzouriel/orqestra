@@ -1,0 +1,1308 @@
+I revalidated the architecture against the **original scope**, the implementation plan we created, and current n8n/Chatwoot behavior. The overall product logic is sound, but I would change several important architectural decisions before turning it into the execution backlog. 
+
+# Revalidated conclusion
+
+The system should be treated as:
+
+> **One operational platform with shared infrastructure and several business capabilities — not eight isolated automation projects.**
+
+The revised structure is:
+
+```text
+                    AI OPERATIONS PLATFORM
+                             │
+          ┌──────────────────┼──────────────────┐
+          │                  │                  │
+       SALES             EXPERIENCE         OPERATIONS
+          │                  │                  │
+       AI SDR          AI Support          Payments
+       Follow-up           RAG             Messaging
+       Checkout       Customer Success     Human Ops
+          │                  │                  │
+          └──────────────────┼──────────────────┘
+                             │
+                    SHARED PLATFORM
+                             │
+       ┌─────────────┬───────┼───────┬─────────────┐
+       ▼             ▼       ▼       ▼             ▼
+    Chatwoot       n8n   PostgreSQL Redis      AI Layer
+       │                       │
+       └─────────── Events / Telemetry ────────────┘
+                             │
+                             ▼
+                    Analytics / Evaluation
+```
+
+And **RabbitMQ becomes optional**, rather than automatically sitting at the center.
+
+---
+
+# 1. Major correction: RabbitMQ vs n8n
+
+Our previous diagram implied:
+
+```text
+RabbitMQ
+   ↓
+n8n workers
+```
+
+as though RabbitMQ were n8n's native execution queue.
+
+That isn't correct.
+
+n8n's own scalable **queue mode uses Redis with workers**, while PostgreSQL stores workflow/execution-related persistent data. n8n can integrate with RabbitMQ/AMQP as part of business workflows, but RabbitMQ is not the mechanism used by n8n's native queue-mode architecture. ([n8n Documentation][1])
+
+So there are actually **two different concepts**:
+
+```text
+A. n8n execution scaling
+
+             Redis
+               │
+       ┌───────┼───────┐
+       ▼       ▼       ▼
+   Worker 1 Worker 2 Worker 3
+       │       │       │
+       └───────┼───────┘
+               ▼
+             n8n
+
+
+B. Business/event messaging
+
+Applications
+     │
+     ▼
+ RabbitMQ       ← optional
+     │
+ ┌───┼────┐
+ ▼   ▼    ▼
+Sales CS Payments
+```
+
+### Recommendation
+
+For V1:
+
+```text
+n8n
+PostgreSQL
+Redis
+Chatwoot
+```
+
+Start there.
+
+Add RabbitMQ **only when we genuinely have multiple producers and consumers that need durable asynchronous event delivery independent of n8n**.
+
+For example:
+
+```text
+payment.completed
+       │
+       ├──► Customer Service
+       ├──► Analytics
+       ├──► Onboarding
+       └──► Billing
+```
+
+At that point RabbitMQ becomes justified.
+
+This simplifies the MVP considerably.
+
+---
+
+# 2. Chatwoot is not our core CRM
+
+The original call describes Chatwoot essentially as:
+
+> everything gets centralized there, therefore it is the CRM.
+
+That's only partly correct. 
+
+Chatwoot is excellent as the **conversation/inbox layer**:
+
+```text
+WhatsApp ─────┐
+Instagram ────┼──► Chatwoot
+Facebook ─────┘
+                  │
+                  ├── conversations
+                  ├── agents
+                  ├── assignments
+                  ├── labels
+                  └── human handoff
+```
+
+It currently supports multiple inboxes/channels, including WhatsApp and Instagram, and its WhatsApp integration is built around the official Cloud API. ([Chatwoot][2])
+
+But I would **not make Chatwoot the authoritative source for the business state**.
+
+Instead:
+
+```text
+Chatwoot
+System of Engagement
+
+        │
+
+PostgreSQL
+System of Record
+```
+
+PostgreSQL should own things such as:
+
+```text
+lead
+customer
+student
+order
+payment
+lead_stage
+lead_score
+engagement
+followup
+subscription
+AI execution
+```
+
+Chatwoot owns:
+
+```text
+conversation
+inbox
+agent
+human assignment
+message presentation
+```
+
+That separation is much cleaner.
+
+---
+
+# 3. Messaging should not be its own late-stage project
+
+Previously we had:
+
+> P05 — Messaging & Social
+
+But SDR, Support and CS cannot exist without messaging.
+
+Therefore messaging is **platform infrastructure**.
+
+Revised:
+
+```text
+                 Channel Layer
+                      │
+        ┌─────────────┼─────────────┐
+        ▼             ▼             ▼
+    WhatsApp       Instagram     Facebook
+        │             │             │
+        └─────────────┼─────────────┘
+                      ▼
+                   Chatwoot
+                      │
+             Conversation Events
+                      │
+                      ▼
+                  AI Router
+```
+
+### Release order
+
+Don't integrate every channel immediately.
+
+Start:
+
+```text
+V1
+WhatsApp
+
+V1.1
+Instagram
+
+V1.2
+Facebook
+```
+
+WhatsApp is clearly the dominant channel in the original requirements. 
+
+---
+
+# 4. I would remove unofficial WhatsApp infrastructure from the core
+
+The source mentions keeping multiple unofficial numbers/chips warming as contingency. 
+
+I would **not architect the platform around that mechanism**.
+
+Production should be designed around:
+
+```text
+WhatsApp Business
+        │
+        ▼
+Meta Cloud API
+        │
+        ▼
+Chatwoot
+```
+
+Current Chatwoot guidance recommends WhatsApp Cloud API for new setups, and template messages handle outbound/re-engagement outside the customer-service window. ([Chatwoot][2])
+
+That gives us a much more stable base for:
+
+* auditing;
+* message status;
+* templates;
+* retries;
+* observability;
+* conversation correlation.
+
+---
+
+# 5. The event layer was correct — but needs to begin on Day 1
+
+This was one of the strongest parts of the earlier architecture.
+
+But putting Data as:
+
+> P07 after Sales, Support, CS...
+
+was wrong.
+
+The **analytics product** comes later.
+
+The **event model** comes first.
+
+From the first production workflow:
+
+```json
+{
+  "event_id": "uuid",
+  "event_type": "lead.message.received",
+  "occurred_at": "...",
+  "entity_id": "...",
+  "conversation_id": "...",
+  "source": "whatsapp",
+  "correlation_id": "...",
+  "payload": {}
+}
+```
+
+Everything important generates events:
+
+```text
+Lead created
+Lead qualified
+Objection detected
+Offer made
+Checkout created
+Payment completed
+
+Student created
+Student activated
+Student inactive
+Support requested
+
+AI responded
+AI used tool
+AI escalated
+Human assumed conversation
+```
+
+This gives us historical truth independent of Chatwoot and n8n.
+
+---
+
+# 6. But don't turn V1 into Kafka-level event architecture
+
+There's also a risk in going too far.
+
+For this size of system, this is sufficient initially:
+
+```text
+                  PostgreSQL
+                     │
+              operational tables
+                     +
+                 event table
+```
+
+For example:
+
+```text
+events
+─────────────────────────
+event_id
+event_type
+entity_type
+entity_id
+conversation_id
+occurred_at
+source
+correlation_id
+payload JSONB
+```
+
+We do **not** initially need:
+
+```text
+Kafka
+Schema Registry
+Flink
+Event Lake
+Streaming Warehouse
+```
+
+That would be architecture for architecture's sake.
+
+---
+
+# 7. AI SDR remains the correct first business capability
+
+This part survives revalidation completely.
+
+The source itself identifies the sales SDR as the fastest mechanism for demonstrating financial ROI. 
+
+However, I would slightly change its design.
+
+Don't build:
+
+```text
+Giant AI agent
+       │
+       ├── sales
+       ├── payment
+       ├── FAQ
+       ├── follow-up
+       ├── everything
+       └── hope
+```
+
+Build:
+
+```text
+              Sales Orchestrator
+                     │
+     ┌───────────────┼───────────────┐
+     ▼               ▼               ▼
+Qualification    Knowledge       Objection
+     │            Retrieval        Engine
+     │               │               │
+     └───────────────┼───────────────┘
+                     ▼
+                  AI Agent
+                     │
+             Approved Tools
+                     │
+      ┌──────────────┼──────────────┐
+      ▼              ▼              ▼
+  Checkout        Follow-up       Handoff
+```
+
+The AI performs reasoning.
+
+The deterministic system performs actions.
+
+That's important.
+
+---
+
+# 8. Lead state must be deterministic
+
+Don't allow the LLM to be the sole authority for:
+
+```text
+lead_stage = WON
+```
+
+Create an explicit state machine:
+
+```text
+NEW
+ │
+ ▼
+CONTACTED
+ │
+ ▼
+QUALIFYING
+ │
+ ├────────► DISQUALIFIED
+ │
+ ▼
+QUALIFIED
+ │
+ ▼
+OFFERED
+ │
+ ▼
+CHECKOUT_STARTED
+ │
+ ├────────► ABANDONED
+ │
+ ▼
+PAID
+```
+
+The AI can recommend:
+
+```text
+QUALIFIED
+```
+
+but deterministic rules or controlled tools update the actual state.
+
+For example:
+
+```text
+payment webhook
+      ↓
+payment.status = PAID
+      ↓
+lead.stage = WON
+```
+
+An LLM should never infer the final sale from conversation text alone.
+
+---
+
+# 9. Follow-up logic should be state-based, not timers scattered through n8n
+
+Original requirement:
+
+```text
+30 min
+1 hour
+1 day
+```
+
+Good business requirement. 
+
+But instead of separate uncontrolled `Wait` nodes everywhere:
+
+```text
+followups
+
+id
+lead_id
+conversation_id
+due_at
+type
+status
+attempt
+cancelled_at
+completed_at
+```
+
+Then:
+
+```text
+Scheduler
+    │
+    ▼
+due followups
+    │
+    ▼
+Still eligible?
+ ┌──┴──┐
+ No    Yes
+ │      │
+Stop   Send
+```
+
+If the lead purchases:
+
+```text
+payment.completed
+       ↓
+cancel pending followups
+```
+
+Much safer.
+
+---
+
+# 10. The initial Lead Score design was premature
+
+Previously we gave examples:
+
+```text
+opened message +5
+asked price +15
+checkout +25
+```
+
+That's useful conceptually, but we shouldn't pretend those weights are correct.
+
+Instead:
+
+### Phase 1
+
+Collect behavior.
+
+```text
+message_read
+message_sent
+price_question
+checkout_clicked
+checkout_started
+group_joined
+link_clicked
+purchase
+```
+
+### Phase 2
+
+Start with simple business rules.
+
+```text
+Hot:
+checkout_started
+
+Warm:
+price_question OR multiple interactions
+
+Cold:
+little/no interaction
+```
+
+### Phase 3
+
+Once we have actual conversion data:
+
+```text
+behavior
+   +
+historical conversion
+   ↓
+calibrated scoring
+```
+
+Then the score has evidence behind it.
+
+---
+
+# 11. Payments must move earlier
+
+In the previous plan, payments came relatively late.
+
+But sales relies on payment information.
+
+So split payments into two stages.
+
+### MVP Payment Capability
+
+```text
+checkout creation
+payment status
+payment webhook
+customer correlation
+```
+
+Required by SDR.
+
+### Later Payment Operations
+
+```text
+proof verification
+manual approval
+collections
+delinquency
+reconciliation
+```
+
+Therefore:
+
+```text
+Sales MVP
+   │
+   ├── AI SDR
+   ├── checkout
+   ├── basic payment integration
+   └── payment confirmation
+```
+
+This is much more coherent.
+
+---
+
+# 12. RAG is valid, but should begin simpler
+
+The requirement definitely needs knowledge retrieval because the source explicitly describes searching courses, training content and lessons. 
+
+But don't immediately build an elaborate ingestion platform.
+
+Start:
+
+```text
+Approved source material
+       ↓
+Clean text
+       ↓
+Chunks
+       ↓
+Metadata
+       ↓
+Embeddings
+       ↓
+Vector index
+```
+
+Metadata becomes extremely important:
+
+```json
+{
+  "course": "nutrition",
+  "module": "module_03",
+  "lesson": "lesson_05",
+  "content_type": "transcript",
+  "version": 2
+}
+```
+
+Then the answer can provide:
+
+```text
+Answer
++
+source lesson
++
+confidence
+```
+
+And if retrieval quality is poor:
+
+```text
+AI → Human
+```
+
+---
+
+# 13. Support and Customer Success must remain separate
+
+This earlier distinction was correct.
+
+### Support
+
+Reactive:
+
+```text
+Student
+   ↓
+"I have a question"
+   ↓
+Support Agent
+```
+
+### Customer Success
+
+Proactive:
+
+```text
+System
+   ↓
+"This student hasn't trained for 15 days"
+   ↓
+CS workflow
+   ↓
+Student
+```
+
+Do not put them in one AI agent.
+
+Different:
+
+* prompts;
+* objectives;
+* permissions;
+* KPIs;
+* triggers.
+
+---
+
+# 14. But Customer Success depends on reliable application data
+
+The original call admits uncertainty around automatically retrieving data from the training application and suggests potentially exporting to Sheets manually. 
+
+That is an important architectural dependency.
+
+Before building CS:
+
+```text
+Does training app expose API?
+          │
+      ┌───┴───┐
+     Yes      No
+      │        │
+    API     Export
+      │        │
+      └───┬────┘
+          ▼
+    Student activity
+          │
+          ▼
+       CS Engine
+```
+
+Without trustworthy activity data, sophisticated inactivity automation is impossible.
+
+Therefore this needs a **spike/discovery task**, not an assumption.
+
+---
+
+# 15. AI Evaluation should not be P08
+
+This was another error in sequencing.
+
+AI evaluation is not something we add in Week 11.
+
+Every AI agent should follow:
+
+```text
+Requirements
+    ↓
+Test conversations
+    ↓
+Prompt/tools
+    ↓
+Evaluation
+    ↓
+Staging
+    ↓
+Production
+```
+
+For the SDR, before production, create perhaps:
+
+```text
+Happy path
+Price objection
+Trust objection
+Unknown question
+Aggressive lead
+Payment question
+Unsupported request
+Human handoff
+Repeated message
+Missing customer data
+```
+
+Then regression-test the same conversations whenever:
+
+```text
+prompt changes
+model changes
+RAG changes
+tool changes
+```
+
+---
+
+# 16. Security also moves from P09 into the foundation
+
+Same problem.
+
+Security isn't a final phase.
+
+From P01:
+
+```text
+Secrets
+RBAC
+TLS
+audit
+PII handling
+data retention
+backups
+access separation
+```
+
+n8n itself exposes security auditing capabilities and flags concerns such as credentials, risky nodes and unprotected webhooks, so this should be part of operational maintenance rather than a one-time final checklist. ([n8n Documentation][3])
+
+---
+
+# 17. Revised architecture
+
+This is the architecture I would actually approve now.
+
+```text
+                         CHANNELS
+             ┌─────────────┼─────────────┐
+             │             │             │
+             ▼             ▼             ▼
+         WhatsApp      Instagram      Facebook
+             │             │             │
+             └─────────────┼─────────────┘
+                           ▼
+                       CHATWOOT
+                  Conversation Layer
+                           │
+                     webhook/events
+                           │
+                           ▼
+                  ┌────────────────┐
+                  │      n8n       │
+                  │ Orchestration  │
+                  └───────┬────────┘
+                          │
+         ┌────────────────┼────────────────┐
+         │                │                │
+         ▼                ▼                ▼
+       SALES            SUPPORT            CS
+       AGENT             AGENT           ENGINE
+         │                │                │
+         │           ┌────┴─────┐          │
+         │           ▼          ▼          │
+         │          RAG     Student API    │
+         │                                 │
+         └──────────────┬──────────────────┘
+                        │
+                        ▼
+               BUSINESS SERVICES
+          ┌─────────────┼──────────────┐
+          ▼             ▼              ▼
+       Payment       Messaging       Customer
+       Service        Service         Service
+          │             │              │
+          └─────────────┼──────────────┘
+                        ▼
+                   PostgreSQL
+                        │
+               ┌────────┴────────┐
+               ▼                 ▼
+         Operational Data       Events
+               │                 │
+               └────────┬────────┘
+                        ▼
+                 Analytics Layer
+
+
+n8n scaling:
+             n8n main
+                │
+               Redis
+          ┌─────┼─────┐
+          ▼     ▼     ▼
+        worker worker worker
+
+
+Optional later:
+               Events
+                 │
+             RabbitMQ
+           ┌─────┼─────┐
+           ▼     ▼     ▼
+         Data   Apps   Integrations
+```
+
+---
+
+# 18. Revised project structure
+
+I would reduce our earlier nine projects to **six delivery streams**.
+
+| Stream                      | Scope                                                  |
+| --------------------------- | ------------------------------------------------------ |
+| **S0 Foundation**           | infra, DB, Redis, n8n, Chatwoot, security, event model |
+| **S1 Revenue**              | SDR, qualification, objections, checkout, follow-up    |
+| **S2 Student Experience**   | RAG, support AI, human handoff                         |
+| **S3 Customer Success**     | onboarding, activity, engagement, reactivation         |
+| **S4 Financial Operations** | payments, proof/reconciliation, collections            |
+| **S5 Intelligence**         | events, metrics, dashboards, AI evaluation             |
+
+And some activities are **cross-cutting**:
+
+```text
+Security
+Observability
+AI evaluation
+Testing
+Events
+Documentation
+```
+
+They don't become isolated final projects.
+
+---
+
+# 19. Revised dependency graph
+
+```text
+                        S0 FOUNDATION
+                              │
+                ┌─────────────┼─────────────┐
+                │             │             │
+                ▼             ▼             ▼
+          Messaging       Data/Event    AI Runtime
+                │             │             │
+                └──────┬──────┴──────┬──────┘
+                       │             │
+                       ▼             ▼
+                 S1 REVENUE     S2 SUPPORT
+                       │             │
+                Payment status      RAG
+                       │             │
+                       ▼             ▼
+                 S4 PAYMENTS     S3 CUSTOMER
+                                    SUCCESS
+                       │             │
+                       └──────┬──────┘
+                              ▼
+                      S5 INTELLIGENCE
+```
+
+But S5's **event collection begins immediately**.
+
+Only dashboards wait.
+
+---
+
+# 20. Revised MVP
+
+The MVP should be narrower than our earlier version.
+
+## MVP objective
+
+> **Prove that AI can receive a WhatsApp lead, conduct a controlled sales conversation, hand off to a human when required, create/route the checkout and recognize conversion.**
+
+That's enough to demonstrate ROI.
+
+### MVP architecture
+
+```text
+WhatsApp
+    │
+    ▼
+Chatwoot
+    │
+    ▼
+n8n
+    │
+    ▼
+AI SDR
+ │  │  │
+ │  │  └──── Human handoff
+ │  │
+ │  └──── Knowledge
+ │
+ └──── Checkout
+           │
+           ▼
+      Payment Gateway
+           │
+           ▼
+       PostgreSQL
+```
+
+Supporting infrastructure:
+
+```text
+PostgreSQL
+Redis
+Logs
+Events
+Basic AI evaluation
+```
+
+### MVP stories
+
+1. Receive lead.
+2. Identify/create lead.
+3. Maintain conversation.
+4. Qualify lead.
+5. Answer product questions.
+6. Handle approved objections.
+7. Escalate uncertainty.
+8. Generate checkout.
+9. Receive payment event.
+10. Cancel follow-up after conversion.
+11. Follow up abandoned leads.
+12. Record telemetry.
+
+That is a legitimate MVP.
+
+---
+
+# 21. Phase 2
+
+Once revenue flow is stable:
+
+```text
+Student Support
+      │
+      ├── RAG
+      ├── course knowledge
+      ├── audio
+      └── human handoff
+```
+
+Success criterion:
+
+> AI resolves a meaningful percentage of repetitive support questions accurately.
+
+Not:
+
+> We created a vector database.
+
+---
+
+# 22. Phase 3
+
+Customer Success:
+
+```text
+Purchase
+   ↓
+Onboarding
+   ↓
+Student activity
+   ↓
+Engagement rules
+   ↓
+Inactivity detection
+   ↓
+AI intervention
+   ↓
+Recovery
+```
+
+Success criterion:
+
+> More students activate and fewer become inactive.
+
+---
+
+# 23. Phase 4
+
+Operational maturity:
+
+```text
+Payment automation
+Group analytics
+Collections
+Advanced lead scoring
+Dashboards
+Cross-channel expansion
+```
+
+Only then would I evaluate whether we genuinely need:
+
+```text
+RabbitMQ
+dedicated services
+separate workers
+more sophisticated analytics infrastructure
+```
+
+---
+
+# 24. Revised roadmap
+
+The original call discusses an MVP around one month and approximately 2.5–3 months for the broader implementation. 
+
+That timeline is **possible only if the scope is phased**, not if everything described is promised as production-grade simultaneously.
+
+### Weeks 1–2 — Foundation + Discovery
+
+```text
+Business processes
+Integrations
+Data contracts
+PostgreSQL
+Redis
+n8n
+Chatwoot
+WhatsApp
+Event model
+Security baseline
+```
+
+### Weeks 3–4 — Revenue MVP
+
+```text
+AI SDR
+Qualification
+Knowledge
+Objection handling
+Checkout
+Payment status
+Human handoff
+Follow-up
+Evaluation
+```
+
+**MVP GO LIVE**
+
+### Weeks 5–6 — Stabilization + Support
+
+```text
+Sales tuning
+RAG ingestion
+Support Agent
+Course retrieval
+Human escalation
+```
+
+### Weeks 7–8 — Customer Success
+
+```text
+App integration
+Onboarding
+Activity tracking
+Inactivity
+Re-engagement
+```
+
+### Weeks 9–10 — Financial Operations
+
+```text
+Payment verification
+Collections
+Manual approval
+Reconciliation
+```
+
+### Weeks 11–12 — Intelligence + Hardening
+
+```text
+Dashboards
+Lead scoring calibration
+Student scoring
+Group analytics
+Performance
+Failure testing
+Backup/restore
+Operational runbooks
+```
+
+---
+
+# 25. End-state data model
+
+I would also simplify our conceptual model around core entities:
+
+```text
+Contact
+  │
+  ├── Lead
+  │    │
+  │    ├── Opportunity
+  │    └── FollowUp
+  │
+  └── Customer
+       │
+       └── Student
+
+Contact
+  │
+  └── Conversation
+        │
+        └── Message
+
+Customer
+  │
+  ├── Order
+  │     └── Payment
+  │
+  └── Subscription
+
+Student
+  │
+  ├── Activity
+  ├── EngagementScore
+  └── SupportCase
+
+AI
+ │
+ └── AIRun
+      ├── Model
+      ├── PromptVersion
+      ├── ToolCall
+      ├── Retrieval
+      └── Evaluation
+```
+
+And everything can emit:
+
+```text
+Event
+```
+
+---
+
+# 26. Key architectural principles
+
+I would formally establish these as ADR-level rules:
+
+1. **PostgreSQL is the business system of record.**
+2. **Chatwoot is the conversation/human-service layer.**
+3. **n8n orchestrates processes; it is not the business database.**
+4. **Redis powers n8n execution scaling where queue mode is needed.**
+5. **RabbitMQ is optional for business-event decoupling, not mandatory for MVP.**
+6. **LLMs recommend/reason; deterministic services modify critical state.**
+7. **Every external side effect must be idempotent.**
+8. **Payment provider is authoritative for payment status.**
+9. **AI evaluation starts before the first AI production release.**
+10. **Observability/security exist from Foundation, not at the end.**
+11. **Events are collected from Day 1.**
+12. **Dashboards come after reliable data exists.**
+13. **Lead scoring is calibrated from evidence rather than invented weights.**
+14. **Support and Customer Success remain separate domains.**
+15. **WhatsApp first; additional channels only after the core flow works.**
+
+---
+
+# 27. The biggest change
+
+Our previous architecture was slightly too much:
+
+> **“Let's design the complete future platform first.”**
+
+I would now use:
+
+> **“Design the minimum architectural boundaries correctly, then progressively add capabilities.”**
+
+So V1 becomes:
+
+```text
+                WhatsApp
+                   │
+                Chatwoot
+                   │
+                  n8n
+             ┌─────┴─────┐
+             ▼           ▼
+          AI SDR       Human
+             │
+          Checkout
+             │
+          Payment
+             │
+        PostgreSQL
+             │
+           Events
+```
+
+Then:
+
+```text
+V2 → Support + RAG
+
+V3 → Customer Success
+
+V4 → Financial automation
+
+V5 → Analytics / scoring / group intelligence
+
+V6 → additional channels / event broker / deeper scale
+```
+
+That is the architecture I would approve for implementation.
+
+The main corrections are therefore **not a change in the business vision**. The original business scope is coherent.  The corrections are about **technical boundaries, sequencing, and avoiding unnecessary infrastructure before the operational volume justifies it**.
+
+[1]: https://docs.n8n.io/workflows/sharing/?utm_source=chatgpt.com "Sharing | n8n Docs"
+[2]: https://www.chatwoot.com/hc/user-guide/articles/1677492191-adding-inboxes?utm_source=chatgpt.com "What is a channel? What is an inbox? | User Guide | Chatwoot"
+[3]: https://docs.n8n.io/hosting/securing/security-audit/?utm_source=chatgpt.com "Security audit | n8n Docs"
